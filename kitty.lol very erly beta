@@ -19353,11 +19353,11 @@ GLOBAL_ENV.Visuals = NeverLose;
 -- (section:AddLabel("Name") returns the row; Add* attaches the pill)
 -- ============================================================
 local Kitty = Window:AddGroup("COMBAT", "target", {
-	{ Icon = "crosshair", Name = "Aimbot" },
+	{ Icon = "crosshair", Name = "Silent Aim" },
 	{ Icon = "sword", Name = "Wallbang" },
 });
 
-local AimbotPage = Kitty.Aimbot;
+local SilentAimPage = Kitty["Silent Aim"];
 local WallbangPage = Kitty.Wallbang;
 
 local function sec(page, name, side)
@@ -19367,7 +19367,7 @@ end;
 -- ------------------------------------------------------------
 -- AIMBOT — silent aim
 -- ------------------------------------------------------------
-local SilentAimSection = sec(AimbotPage, "Silent Aim", "left");
+local SilentAimSection = sec(SilentAimPage, "Silent Aim", "left");
 
 SilentAimSection:AddLabel("Right-click a toggle to bind a key", true);
 
@@ -19453,7 +19453,7 @@ SilentAimSection:AddLabel("Snapline"):AddToggle({
 	Default = false,
 });
 
-local FOVSection = sec(AimbotPage, "FOV", "right");
+local FOVSection = sec(SilentAimPage, "FOV", "right");
 
 FOVSection:AddLabel("Show Circle"):AddToggle({
 	Flag = "SilentAimFOVEnabled",
@@ -19465,7 +19465,7 @@ FOVSection:AddLabel("Circle Color"):AddColorPicker({
 	Default = Color3.fromRGB(255, 255, 255),
 });
 
-local TweaksSection = sec(AimbotPage, "Tweaks & Feedback", "right");
+local TweaksSection = sec(SilentAimPage, "Tweaks & Feedback", "right");
 
 TweaksSection:AddLabel("Stealth Filter"):AddToggle({
 	Flag = "SilentAimStealthFilter",
