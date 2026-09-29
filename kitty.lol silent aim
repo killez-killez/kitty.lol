@@ -18258,6 +18258,72 @@ local VirtualUser = game:GetService("VirtualUser");
 local GLOBAL_ENV = getgenv and getgenv() or _G;
 local Camera = workspace.CurrentCamera;
 
+-- ============================================================
+-- ADONIS ANTICHEAT SHIELD (hook-free)
+-- Adonis detects executor sessions without needing a hook, and
+-- separately scans for kick-bypass tampering ("Anti kick found!
+-- Method 0x3" = it caught a hooked LocalPlayer:Kick). So this
+-- shield NEVER hooks anything. It only defuses Adonis's client
+-- detection tables in the Lua heap:
+--   - detection registry entries (namecallInstance) -> disarmed
+--   - Detected handlers -> no-op
+--   - AntiKick check tables -> disarmed
+-- ============================================================
+do
+	local function sweepRegistry()
+		local hits = 0;
+		pcall(function()
+			local gc = getgc and getgc();
+			if type(gc) ~= "table" then return end;
+			local swept = 0;
+			for _, v in ipairs(gc) do
+				swept += 1;
+				if swept > 80000 then break end;
+				if type(v) == "table" then
+					local okR, nc = pcall(rawget, v, "namecallInstance");
+					if okR and nc ~= nil then
+						pcall(rawset, v, "namecallInstance", false);
+						hits += 1;
+					end;
+					local okD, det = pcall(rawget, v, "Detected");
+					if okD and type(det) == "function" then
+						pcall(rawset, v, "Detected", function() return false end);
+						hits += 1;
+					end;
+					for _, key in ipairs({ "AntiKick", "antiKick", "Anti Kick", "anti_kick" }) do
+						local okA, ak = pcall(rawget, v, key);
+						if okA and ak ~= nil then
+							pcall(rawset, v, key, false);
+							hits += 1;
+						end;
+					end;
+				end;
+			end;
+		end);
+		return hits;
+	end;
+
+	local function report(n, suffix)
+		if n > 0 then
+			print(("[kitty.lol] adonis shield: disarmed %d check(s)%s"):format(n, suffix or ""));
+		end;
+	end;
+
+	report(sweepRegistry(), " at load");
+	-- Adonis boots a few seconds after join and re-checks periodically:
+	-- sweep often early, then forever at a low rate
+	task.spawn(function()
+		for _ = 1, 8 do
+			task.wait(15);
+			report(sweepRegistry());
+		end;
+		while true do
+			task.wait(30);
+			report(sweepRegistry());
+		end;
+	end);
+end;
+
 -- flag helpers: this adapter stores control objects in NeverLose.Flags,
 -- so read through their GetValue() with per-flag fallbacks
 local function F(flag, fallback)
@@ -18994,21 +19060,43 @@ local function NoclipStep()
 end;
 
 local WasFlying = false;
-local function FlyStep()
+local FlyVelocity = Vector3.zero; -- smoothed velocity carried between frames
+local FlyDtSmooth = 1 / 60;       -- EMA of frame time (frame-rate independent feel)
+
+local function FlyStep(dt)
 	local flying = fb("FlyEnabled");
 	if flying and not WasFlying then
 		local char = LocalPlayer.Character;
 		local hum = char and char:FindFirstChildOfClass("Humanoid");
+		-- AutoRotate off while flying: rotation is handled manually below
+		-- (Physics state leaves rotation free, which is where spin comes from)
 		if hum then
-			hum:ChangeState(Enum.HumanoidStateType.Physics);
-		end;
+				hum.AutoRotate = false;
+				hum:ChangeState(Enum.HumanoidStateType.Physics);
+			end;
+			-- start from current velocity (Y zeroed) so takeoff glides, no jerk
+		local root2 = char and char:FindFirstChild("HumanoidRootPart");
+		FlyVelocity = root2 and root2.AssemblyLinearVelocity or Vector3.zero;
+		FlyVelocity = Vector3.new(FlyVelocity.X, 0, FlyVelocity.Z);
 		WasFlying = true;
 	elseif not flying and WasFlying then
 		local char = LocalPlayer.Character;
 		local hum = char and char:FindFirstChildOfClass("Humanoid");
 		if hum then
-			hum:ChangeState(Enum.HumanoidStateType.GettingUp);
+				-- restore rotation control unless spin bot owns it right now
+				hum.AutoRotate = not fb("SpinBot");
+				hum:ChangeState(Enum.HumanoidStateType.GettingUp);
+			end;
+		-- keep some horizontal momentum on landing instead of a hard stop
+		local root2 = char and char:FindFirstChild("HumanoidRootPart");
+		if root2 then
+			local v = root2.AssemblyLinearVelocity;
+			local flat = Vector3.new(v.X, 0, v.Z);
+			if flat.Magnitude > 1 then
+				root2.AssemblyLinearVelocity = flat.Unit * math.min(flat.Magnitude, 24);
+			end;
 		end;
+		FlyVelocity = Vector3.zero;
 		WasFlying = false;
 	end;
 	if not flying then
@@ -19019,19 +19107,36 @@ local function FlyStep()
 	if not root then
 		return;
 	end;
+	local hum = char:FindFirstChildOfClass("Humanoid");
+	if hum then
+		hum.AutoRotate = false; -- games can flip this back on mid-flight
+	end;
+
+	dt = dt or 1 / 60;
+	FlyDtSmooth += (dt - FlyDtSmooth) * 0.1;
+
+	-- camera-relative but FLAT: pitching the view must not nose-dive you;
+	-- vertical is Space / Ctrl only (classic fly feel)
 	local camCF = Camera.CFrame;
+	local look = camCF.LookVector;
+	local flatLook = Vector3.new(look.X, 0, look.Z);
+	flatLook = (flatLook.Magnitude > 0.01) and flatLook.Unit or Vector3.zero;
+	local right = camCF.RightVector;
+	local flatRight = Vector3.new(right.X, 0, right.Z);
+	flatRight = (flatRight.Magnitude > 0.01) and flatRight.Unit or Vector3.zero;
+
 	local moveDir = Vector3.zero;
 	if UserInputService:IsKeyDown(Enum.KeyCode.W) then
-		moveDir += camCF.LookVector;
+		moveDir += flatLook;
 	end;
 	if UserInputService:IsKeyDown(Enum.KeyCode.S) then
-		moveDir -= camCF.LookVector;
+		moveDir -= flatLook;
 	end;
 	if UserInputService:IsKeyDown(Enum.KeyCode.A) then
-		moveDir -= camCF.RightVector;
+		moveDir -= flatRight;
 	end;
 	if UserInputService:IsKeyDown(Enum.KeyCode.D) then
-		moveDir += camCF.RightVector;
+		moveDir += flatRight;
 	end;
 	if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
 		moveDir += Vector3.new(0, 1, 0);
@@ -19042,7 +19147,36 @@ local function FlyStep()
 	if moveDir.Magnitude > 0 then
 		moveDir = moveDir.Unit;
 	end;
-	root.AssemblyLinearVelocity = moveDir * F("FlySpeed", 100);
+
+	-- glide toward the target velocity instead of snapping: exponential
+	-- smoothing with frame-rate independent strength (0.1s time constant:
+	-- responsive but silky; direction changes swing wide like real momentum)
+	local target = moveDir * F("FlySpeed", 100);
+	local accel = 1 - math.exp(-FlyDtSmooth / 0.1);
+	FlyVelocity = FlyVelocity:Lerp(target, accel);
+
+	-- below 0.05 st/s there is nothing left to smooth — snap to zero so
+	-- releasing keys stops exactly (no microscopic drift)
+	if FlyVelocity.Magnitude < 0.05 and moveDir.Magnitude == 0 then
+		FlyVelocity = Vector3.zero;
+	end;
+
+	root.AssemblyLinearVelocity = FlyVelocity;
+
+	-- kill the tumble/spin for real: the old fix read yaw off the root
+	-- itself, so any rotation physics added between frames got preserved as
+	-- the new yaw -> endless drift (the "spin"). Reference an EXTERNAL
+	-- source instead: face the camera's flat look direction, upright, and
+	-- zero angular velocity every frame.
+	local yaw;
+	if flatLook.Magnitude > 0.01 then
+		yaw = math.atan2(-flatLook.X, -flatLook.Z);
+	else
+		local rlook = root.CFrame.LookVector;
+		yaw = math.atan2(-rlook.X, -rlook.Z);
+	end;
+	root.CFrame = CFrame.new(root.Position) * CFrame.Angles(0, yaw, 0);
+	root.AssemblyAngularVelocity = Vector3.zero;
 end;
 
 -- ---- anti-AFK: terminate the game's idle kick signals ----
@@ -19216,6 +19350,65 @@ local function CFrameSpeedStep(dt)
 	root.CFrame = root.CFrame + (hum.MoveDirection * F("CFrameSpeedAmount", 1) * dt * 16);
 end;
 
+-- force 3rd person: fights games that lock the camera into first person —
+-- re-asserts Classic mode + a minimum zoom every frame (a one-shot set gets
+-- overwritten by games that re-lock each frame)
+local FTPCaptured = false;
+local FTPOldMode, FTPOldMinZoom;
+local function ForceThirdPersonStep()
+	if fb("ForceThirdPerson") then
+		if not FTPCaptured then
+			FTPCaptured = true;
+			FTPOldMode = LocalPlayer.CameraMode;
+			FTPOldMinZoom = LocalPlayer.CameraMinZoomDistance;
+		end;
+		pcall(function()
+			if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
+				LocalPlayer.CameraMode = Enum.CameraMode.Classic;
+			end;
+			if LocalPlayer.CameraMinZoomDistance < 6 then
+				LocalPlayer.CameraMinZoomDistance = 6;
+			end;
+		end);
+	elseif FTPCaptured then
+		FTPCaptured = false;
+		pcall(function()
+			LocalPlayer.CameraMode = FTPOldMode or Enum.CameraMode.Classic;
+			LocalPlayer.CameraMinZoomDistance = FTPOldMinZoom or 0.5;
+		end);
+	end;
+end;
+
+-- aspect ratio stretch: scales the camera's up vector after the camera
+-- updates each frame (BindToRenderStep above Camera priority)
+local AspectBound = false;
+local ASPECT_KEY = "kitty_aspect_ratio";
+local function applyAspect()
+	local cam = workspace.CurrentCamera;
+	if not cam then return end;
+	local ax = F("AspectX", 16);
+	local ay = math.max(F("AspectY", 9), 1);
+	if ax <= 0 then return end;
+	local ratio = ax / ay;
+	if math.abs(ratio - 1) < 0.001 then return end;
+	local cf = cam.CFrame;
+	cam.CFrame = CFrame.fromMatrix(cf.Position, cf.RightVector, cf.UpVector * ratio, -cf.LookVector);
+end;
+local function AspectStep()
+	local on = fb("AspectEnabled");
+	if on and not AspectBound then
+		AspectBound = true;
+		pcall(function()
+			RunService:BindToRenderStep(ASPECT_KEY, Enum.RenderPriority.Camera.Value + 2, applyAspect);
+		end);
+	elseif not on and AspectBound then
+		AspectBound = false;
+		pcall(function()
+			RunService:UnbindFromRenderStep(ASPECT_KEY);
+		end);
+	end;
+end;
+
 -- inf jump
 local InfJumpConn = UserInputService.JumpRequest:Connect(function()
 	if not fb("InfJump") then
@@ -19259,6 +19452,250 @@ if HasDrawing then
 end;
 
 local LastFrameTick = os.clock();
+
+-- ============================================================
+-- SERVER HOPPER + RADAR + FAKE LAG
+-- ============================================================
+local TeleportService = game:GetService("TeleportService");
+local HttpService = game:GetService("HttpService");
+
+-- ---- server hopper: scan instances, join the emptiest one ----
+local function hopperRequest(url)
+	local grab = (syn and syn.request) or (http and http.request)
+		or (getgenv and (rawget(getgenv(), "http_request") or rawget(getgenv(), "request")))
+		or http_request or request;
+	if type(grab) ~= "function" then
+		return nil, "no http function in this executor";
+	end;
+	local ok, res = pcall(grab, { Url = url, Method = "GET" });
+	if not ok or type(res) ~= "table" or type(res.Body) ~= "string" then
+		return nil, "http request failed";
+	end;
+	local okD, data = pcall(HttpService.JSONDecode, HttpService, res.Body);
+	if not okD or type(data) ~= "table" or type(data.data) ~= "table" then
+		return nil, "bad server list";
+	end;
+	return data.data;
+end;
+
+local function pickServer(mode)
+	local placeId = game.PlaceId;
+	local cursor = "";
+	local best, bestCount = nil, math.huge;
+		local pool = nil;
+	for page = 1, 3 do
+		local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s")
+			:format(placeId, cursor ~= "" and ("&cursor=" .. cursor) or "");
+		local list, err = hopperRequest(url);
+		if not list then
+			return nil, err;
+		end;
+		for _, srv in ipairs(list) do
+			if type(srv) == "table" and srv.id and type(srv.playing) == "number" and srv.playing < srv.maxPlayers then
+				if mode == "New" then
+					pool = pool or {};
+					pool[#pool + 1] = srv.id;
+				else
+					local score = (mode == "Fill" and (1000 - srv.playing) or srv.playing);
+					if score < bestCount then
+						bestCount = score;
+						best = srv.id;
+					end;
+				end;
+			end;
+		end;
+		cursor = (type(list.nextPageCursor) == "string") and list.nextPageCursor or "";
+		if best or cursor == "" then break end;
+		task.wait(0.1);
+	end;
+	if not best and pool and #pool > 0 then
+		best = pool[math.random(1, #pool)];
+	end;
+	if not best then
+		return nil, "no other server found";
+	end;
+	return best;
+end;
+
+local function hopNow(mode)
+	task.spawn(function()
+		notify("kitty.lol", "Scanning servers (" .. mode .. ")...", 4);
+		local id, err = pickServer(mode);
+		if not id then
+			notify("kitty.lol", "Hopper: " .. tostring(err), 6);
+			return;
+		end;
+		notify("kitty.lol", "Teleporting...", 3);
+		task.wait(0.3);
+		pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, id, LocalPlayer);
+		end);
+	end);
+end;
+
+-- ---- auto rejoin on kick / disconnect ----
+do
+	local rejoined = false;
+	local function rejoin()
+		if rejoined then return end;
+		if not fb("AutoRejoin") then return end;
+		rejoined = true;
+		pcall(function()
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer);
+		end);
+	end;
+	LocalPlayer.OnTeleport:Connect(function(state)
+		if state == Enum.TeleportState.Failed then rejoin() end;
+	end);
+	-- queue the fallback BEFORE anything can kick us (runs in the next
+	-- instance after a kick disconnects us)
+	if queue_on_teleport and GLOBAL_ENV.KittyAutoRejoin then
+		pcall(queue_on_teleport, "if not (getgenv and getgenv().KittyAutoRejoin) then return end while true do if game.JobId ~= '' then break end task.wait(0.5) end game:GetService('TeleportService'):TeleportToPlaceInstance(" .. game.PlaceId .. ", '" .. game.JobId .. "', game:GetService('Players').LocalPlayer)");
+	end;
+end;
+
+-- ---- radar: corner minimap, dots = other players (aim candidate loop) ----
+local RadarOn = false;
+local RadarFrame, RadarDots = nil, {};
+
+local function radarClear()
+	for _, d in ipairs(RadarDots) do pcall(function() d:Remove() end); end;
+	RadarDots = {};
+end;
+
+local function setRadar(on)
+	if on == RadarOn then return end;
+	RadarOn = on;
+	if on then
+		if not HasDrawing then
+			notify("kitty.lol", "Your executor has no Drawing lib - radar unavailable.", 6);
+			RadarOn = false;
+			return;
+		end;
+		RadarFrame = Drawing.new("Square");
+		RadarFrame.Thickness = 1;
+		RadarFrame.Size = Vector2.new(150, 150);
+		RadarFrame.Position = Vector2.new(20, 20);
+		RadarFrame.Color = Color3.fromRGB(0, 0, 0);
+		RadarFrame.Transparency = 0.55;
+		RadarFrame.Filled = true;
+		RadarFrame.Visible = true;
+	else
+		radarClear();
+		pcall(function() if RadarFrame then RadarFrame:Remove() end end);
+		RadarFrame = nil;
+	end;
+end;
+
+local function RadarStep()
+	if not RadarOn then return end;
+	if Camera ~= workspace.CurrentCamera then Camera = workspace.CurrentCamera; end;
+	if not RadarFrame then return end;
+	local size = RadarFrame.Size;
+	local pos = RadarFrame.Position;
+	local half = size.X / 2;
+	local center = pos + size / 2;
+	local RANGE = F("RadarRange", 300); -- studs mapped to the radar radius
+	local lpChar = LocalPlayer.Character;
+	local lpRoot = lpChar and lpChar:FindFirstChild("HumanoidRootPart");
+	if not lpRoot then
+		radarClear();
+		return;
+	end;
+	local inv = lpRoot.CFrame:Inverse();
+
+	local wanted = 0;
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer and IsAlive(plr) and not SameTeam(plr) then
+			local cache = cacheCharacter(plr);
+			local root = cache and cache.root;
+			if root then
+				wanted += 1;
+				local dot = RadarDots[wanted];
+				if not dot then
+					dot = Drawing.new("Circle");
+					dot.Radius = 3;
+					dot.Filled = true;
+					dot.Thickness = 1;
+					RadarDots[wanted] = dot;
+				end;
+				local rel = inv:PointToObjectSpace(root.Position);
+				local dx, dz = rel.X, rel.Z;
+				local dist = math.sqrt(dx * dx + dz * dz);
+				if dist > RANGE then
+					dx = dx / dist * RANGE;
+					dz = dz / dist * RANGE;
+				end;
+				-- clamp to a circle (no corners)
+				local m = math.sqrt(dx * dx + dz * dz);
+				if m > half - 5 then
+					dx = dx / m * (half - 5);
+					dz = dz / m * (half - 5);
+				end;
+				dot.Position = Vector2.new(center.X + dx, center.Y + dz);
+				dot.Color = Color3.fromRGB(255, 80, 80);
+				dot.Visible = true;
+			end;
+		end;
+	end;
+	for i = #RadarDots, wanted + 1, -1 do
+		pcall(function() RadarDots[i]:Remove() end);
+		RadarDots[i] = nil;
+	end;
+end;
+
+onUnload("radar", function()
+	setRadar(false);
+end);
+
+-- ---- fake lag / desync: choke replication so your hitbox jitters ----
+local LagHold = false;      -- currently holding packets
+local LagRealPos = nil;     -- where we really are
+local LagHoldStart = 0;
+
+local function setFakeLag(on)
+	if on == LagHold or not on then
+		if not on and LagHold and LagRealPos then
+			-- release: unanchor and let physics resume from the held spot
+			local char = LocalPlayer.Character;
+			local root = char and char:FindFirstChild("HumanoidRootPart");
+			if root then
+				root.Anchored = false;
+				root.AssemblyLinearVelocity = Vector3.zero;
+			end;
+			LagRealPos = nil;
+		end;
+		LagHold = on;
+	end;
+end;
+
+local function FakeLagStep()
+	if not fb("FakeLagEnabled") then
+		if LagHold then setFakeLag(false) end;
+		return;
+	end;
+	local char = LocalPlayer.Character;
+	local root = char and char:FindFirstChild("HumanoidRootPart");
+	if not root then return end;
+	local dur = F("FakeLagDuration", 0.3);
+	local off = F("FakeLagIdle", 0.3);
+	local phase = (tick() - LagHoldStart) % (dur + off);
+	local shouldHold = phase < dur;
+	if shouldHold and not LagHold then
+		LagHold = true;
+		LagHoldStart = tick();
+		LagRealPos = root.CFrame;
+		root.Anchored = true; -- choke: pin replication at the held spot
+	elseif not shouldHold and LagHold then
+		setFakeLag(false);
+		LagHoldStart = tick();
+	end;
+end;
+
+onUnload("fake lag", function()
+	setFakeLag(false);
+end);
+
 local RenderConn = RunService.RenderStepped:Connect(function()
 	if Camera ~= workspace.CurrentCamera then
 		Camera = workspace.CurrentCamera;
@@ -19318,10 +19755,16 @@ local RenderConn = RunService.RenderStepped:Connect(function()
 
 	-- ---- movement ----
 	NoclipStep();
-	FlyStep();
+	FlyStep(dtSafe);
 	WalkSpeedStep();
 	MoreMovementStep(dtSafe);
 	CFrameSpeedStep(dtSafe);
+	ForceThirdPersonStep();
+	AspectStep();
+
+	-- ---- radar / fake lag ----
+	RadarStep();
+	FakeLagStep();
 end);
 
 -- ============================================================
@@ -19329,6 +19772,19 @@ end);
 -- ============================================================
 onUnload("kitty engine", function()
 	teardownSilentHook();
+	pcall(function()
+		if AspectBound then
+			AspectBound = false;
+			RunService:UnbindFromRenderStep(ASPECT_KEY);
+		end;
+	end);
+	pcall(function()
+		if FTPCaptured then
+			FTPCaptured = false;
+			LocalPlayer.CameraMode = FTPOldMode or Enum.CameraMode.Classic;
+			LocalPlayer.CameraMinZoomDistance = FTPOldMinZoom or 0.5;
+		end;
+	end);
 	pcall(function() ClickTPConn:Disconnect() end);
 	pcall(function() InfJumpConn:Disconnect() end);
 	pcall(function() RenderConn:Disconnect() end);
@@ -19680,6 +20136,77 @@ clickTPRow:AddKeybind({
 	Default = "X",
 });
 
+
+-- ------------------------------------------------------------
+-- SERVER HOPPER
+-- ------------------------------------------------------------
+local HopSection = sec(MovementPage, "Server", "right");
+
+HopSection:AddLabel("Hop Mode"):AddDropdown({
+	Flag = "HopperMode",
+	Values = { "Lowest Population", "Newest Server", "Fill Server" },
+	Default = "Lowest Population",
+});
+
+HopSection:AddLabel("Hop Now"):AddToggle({
+	Flag = "HopperFire",
+	Default = false,
+	Callback = function(on)
+		if on then
+			local mode = F("HopperMode", "Lowest Population");
+			hopNow(mode == "Newest Server" and "New" or (mode == "Fill Server" and "Fill" or "Low"));
+			task.defer(function()
+				local it = NeverLose.Flags.HopperFire;
+				if it and it.SetValue then pcall(it.SetValue, it, false) end;
+			end);
+		end;
+	end,
+});
+
+HopSection:AddLabel("Rejoin On Kick"):AddToggle({
+	Flag = "AutoRejoin",
+	Default = false,
+	Callback = function(on) GLOBAL_ENV.KittyAutoRejoin = on or nil end,
+});
+
+HopSection:AddLabel("Radar"):AddToggle({
+	Flag = "RadarEnabled",
+	Default = false,
+	Callback = function(on) setRadar(on) end,
+});
+
+HopSection:AddLabel("Radar Range"):AddSlider({
+	Flag = "RadarRange",
+	Min = 100,
+	Max = 1000,
+	Default = 300,
+	Rounding = 0,
+	Type = " st",
+});
+
+HopSection:AddLabel("Fake Lag"):AddToggle({
+	Flag = "FakeLagEnabled",
+	Default = false,
+});
+
+HopSection:AddLabel("Choke Time"):AddSlider({
+	Flag = "FakeLagDuration",
+	Min = 0.05,
+	Max = 1.5,
+	Default = 0.3,
+	Rounding = 2,
+	Type = "s",
+});
+
+HopSection:AddLabel("Gap Between"):AddSlider({
+	Flag = "FakeLagIdle",
+	Min = 0.05,
+	Max = 2,
+	Default = 0.3,
+	Rounding = 2,
+	Type = "s",
+});
+
 Move2Section:AddLabel("Max TP Distance"):AddSlider({
 	Flag = "ClickTPMaxDist",
 	Min = 10,
@@ -19723,6 +20250,17 @@ UtilSection:AddButton({
 end; -- KittyBuildMovementPage
 
 notify("kitty.lol", "Loaded — silent aim, wallbang & movement. Menu key: RightShift.", 5);
+
+-- console helper: SetAspect(16, 9, true) mirrors the UI flags
+GLOBAL_ENV.SetAspect = function(x, y, on)
+	local function setFlag(flag, v)
+		local it = NeverLose.Flags[flag];
+		if it and it.SetValue then pcall(it.SetValue, it, v) end;
+	end;
+	if x then setFlag("AspectX", x) end;
+	if y then setFlag("AspectY", y) end;
+	if on ~= nil then setFlag("AspectEnabled", on) end;
+end;
 
 end; -- end kitty scope
 
@@ -19793,7 +20331,7 @@ Sections.Guns = Visuals.ESP:AddSection({ Name = "Gun Chams", Position = "left" }
 
 local S = {
 	Enabled = false, Target = "Other",
-	ThroughWalls = false,
+	ThroughWalls = false, HealthBar = false,
 
 	Skeleton = false, SkeletonColor = Color3.fromRGB(255, 255, 255),
 	Arrows = false, ArrowColor = Color3.fromRGB(255, 255, 255),
@@ -20157,15 +20695,24 @@ do
 	local function bundleOf(player)
 		if bundles[player] then return bundles[player] end;
 
-		local b = {
+			local b = {
 			name = Drawing.new("Text"),
 			arrow = arrowImage(),
 			bones = {},
 			fill = square(true),
+			hpBg = Drawing.new("Square"),
+			hpFill = Drawing.new("Square"),
 			bars = {},
 			outlines = {},
 			edges = {},
 		};
+
+		b.hpBg.Filled = true;
+		b.hpBg.Thickness = 1;
+		b.hpBg.Visible = false;
+		b.hpFill.Filled = true;
+		b.hpFill.Thickness = 1;
+		b.hpFill.Visible = false;
 
 		b.name.Size = 13;
 		b.name.Center = true;
@@ -20186,6 +20733,8 @@ do
 	local function hideBox(b)
 		b.name.Visible = false;
 		b.fill.Visible = false;
+		b.hpBg.Visible = false;
+		b.hpFill.Visible = false;
 
 		for _, piece in ipairs(b.bars) do piece.Visible = false end;
 		for _, piece in ipairs(b.outlines) do piece.Visible = false end;
@@ -20592,6 +21141,8 @@ do
 		if b then
 			destroyAny(b.name);
 			destroyAny(b.arrow);
+			destroyAny(b.hpBg);
+			destroyAny(b.hpFill);
 
 			for _, bone in ipairs(b.bones) do destroyAny(bone) end;
 			destroyAny(b.fill);
@@ -21633,7 +22184,7 @@ do
 				and (S.ThroughWalls or ESP.Visibility.Character(Camera, char, root));
 			local at, size, corners;
 
-			if draw and (S.Box or S.Name) then
+			if draw and (S.Box or S.Name or S.HealthBar) then
 				at, size, corners = screenBox(char);
 			end;
 
@@ -21685,6 +22236,25 @@ do
 				b.name.Visible = false;
 			end;
 
+			-- health bar: vertical bar on the box's left edge, green→red by HP
+			if draw and S.HealthBar and at and human then
+				local hpPct = math.clamp(human.Health / math.max(human.MaxHealth, 1), 0, 1);
+				local barW = 3;
+				local barX = at.X - barW - 4;
+				local filled = size.Y * hpPct;
+				b.hpBg.Visible = true;
+				b.hpBg.Color = Color3.fromRGB(15, 15, 15);
+				b.hpBg.Position = Vector2.new(barX - 1, at.Y - 1);
+				b.hpBg.Size = Vector2.new(barW + 2, size.Y + 2);
+				b.hpFill.Visible = true;
+				b.hpFill.Color = Color3.fromRGB(255 - (hpPct * 255), hpPct * 255, 0);
+				b.hpFill.Position = Vector2.new(barX, at.Y + (size.Y - filled));
+				b.hpFill.Size = Vector2.new(barW, filled);
+			else
+				b.hpBg.Visible = false;
+				b.hpFill.Visible = false;
+			end;
+
 		end;
 
 		end);
@@ -21726,6 +22296,11 @@ Sections.ESP:AddLabel("Target"):AddDropdown({
 Sections.ESP:AddLabel("Through Walls"):AddToggle({
 	Default = false, Flag = "esp_through_walls",
 	Callback = function(v) S.ThroughWalls = v end,
+});
+
+Sections.ESP:AddLabel("Health Bar"):AddToggle({
+	Default = false, Flag = "esp_health_bar",
+	Callback = function(v) S.HealthBar = v end,
 });
 
 local espName = Sections.ESP:AddLabel("Name");
@@ -31314,24 +31889,9 @@ guard("combat", function()
 		if not to then to = select(1, aimFor()) end;
 		recordAttack(kind, tool, from, to, target, "remote");
 	end;
-	local hookState = GLOBAL.__VisualsCombatHook;
-	if type(hookState) ~= "table" and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
-		hookState = {};
-		local old;
-		old = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-			local method = getnamecallmethod();
-			if method == "FireServer" or method == "InvokeServer" then
-				local active = GLOBAL.__VisualsCombatRuntime;
-				if type(active) == "table" and active.Active and type(active.ObserveRemote) == "function" then
-					local args = table.pack(...);
-					task.defer(function() pcall(active.ObserveRemote, self, args) end);
-				end;
-			end;
-			return old(self, ...);
-		end));
-		hookState.Old = old;
-		GLOBAL.__VisualsCombatHook = hookState;
-	end;
+	-- NOTE: no __namecall hook here. Adonis's "namecallInstance" detector
+	-- kicks anyone with a namecall hook installed (Error Code: 267), so
+	-- remote-fire observation is disabled; humanoid/tool logging still runs.
 	GLOBAL.__VisualsCombatRuntime = runtime;
 
 	for _, player in ipairs(Players:GetPlayers()) do
@@ -35591,6 +36151,32 @@ guard("camera", function()
 	end;
 
 	local row = Sections.Camera:AddLabel("Field of View");
+
+	local ftpRow = Sections.Camera:AddLabel("Force 3rd Person");
+	ftpRow:AddToggle({
+		Default = false,
+		Flag = "ForceThirdPerson",
+	});
+
+	local aspectRow = Sections.Camera:AddLabel("Aspect Ratio");
+	aspectRow:AddToggle({
+		Default = false,
+		Flag = "AspectEnabled",
+	});
+	aspectRow:AddSlider({
+		Flag = "AspectX",
+		Min = 1,
+		Max = 32,
+		Default = 16,
+		Rounding = 0,
+	});
+	aspectRow:AddSlider({
+		Flag = "AspectY",
+		Min = 1,
+		Max = 32,
+		Default = 9,
+		Rounding = 0,
+	});
 
 	row:AddToggle({
 		Name = "Field of View",
